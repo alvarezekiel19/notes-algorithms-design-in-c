@@ -24,84 +24,153 @@ jobs:
           - compiler: clang
             cc: clang
             cxx: clang++
+      fail-fast: false
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/apt
+            ~/build
+          key: ${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
+            ${{ runner.os }}-${{ matrix.compiler }}-
+            ${{ runner.os }}-
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential ${{ matrix.compiler }} \
-                                  valgrind cppcheck clang-tools
+                                  valgrind cppcheck clang-tools gcovr
 
       - name: Configure CMake
         run: |
-          mkdir build
+          mkdir -p build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-                   -DCMAKE_C_COMPILER=${{ matrix.cc }}
+                   -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+                   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
         run: |
           cd build
-          cmake --build . --parallel $(nproc) --verbose
+          cmake --build . --parallel $(nproc)
 
       - name: Run tests
         run: |
           cd build
-          ctest --output-on-failure --parallel $(nproc) --verbose
+          ctest --output-on-failure --parallel $(nproc) --timeout 60
 
       - name: Run tests by category
         if: matrix.build_type == 'Debug'
         run: |
           cd build
-          echo "=== Testing Algorithms ===" >> $GITHUB_STEP_SUMMARY
-          ctest -L algorithms --output-on-failure >> test_algorithms.log 2>&1 || true
-          echo "=== Testing Data Structures ===" >> $GITHUB_STEP_SUMMARY
-          ctest -L data_structures --output-on-failure >> test_ds.log 2>&1 || true
-          echo "=== Testing Fundamentals ===" >> $GITHUB_STEP_SUMMARY
-          ctest -L fundamentals --output-on-failure >> test_fundamentals.log 2>&1 || true
+          echo "## Test Results by Category" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Algorithm Tests" >> $GITHUB_STEP_SUMMARY
+          if ctest -L algorithms --output-on-failure --timeout 30 > test_algorithms.log 2>&1; then
+            echo "✅ Algorithm tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Algorithm tests failed" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Algorithm Test Output</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -20 test_algorithms.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### Data Structure Tests" >> $GITHUB_STEP_SUMMARY
+          if ctest -L data_structures --output-on-failure --timeout 30 > test_ds.log 2>&1; then
+            echo "✅ Data structure tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Data structure tests failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "### Fundamental Tests" >> $GITHUB_STEP_SUMMARY
+          if ctest -L fundamentals --output-on-failure --timeout 30 > test_fundamentals.log 2>&1; then
+            echo "✅ Fundamental tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Fundamental tests failed" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Memory leak check
         if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
         run: |
           cd build
+          echo "## Memory Leak Check" >> $GITHUB_STEP_SUMMARY
+          LEAK_FOUND=false
+
           find . -name "*test*" -executable -type f | head -5 | while read test; do
             echo "Checking $test with valgrind..."
-            valgrind --leak-check=full --error-exitcode=1 "$test" || echo "Memory issues in $test"
+            if ! timeout 30 valgrind --leak-check=full --error-exitcode=1 --quiet "$test" 2>/dev/null; then
+              echo "⚠️ Memory issues detected in $test" >> $GITHUB_STEP_SUMMARY
+              LEAK_FOUND=true
+            fi
           done
+
+          if [ "$LEAK_FOUND" = false ]; then
+            echo "✅ No memory leaks detected" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Generate coverage report
         if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
         run: |
-          sudo apt-get install -y gcovr
           cd build
           # Re-configure with coverage flags
-          cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="--coverage" -DCMAKE_C_COMPILER=gcc
+          cmake .. -DCMAKE_BUILD_TYPE=Debug \
+                   -DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+                   -DCMAKE_C_COMPILER=gcc
           cmake --build . --parallel $(nproc)
-          ctest --output-on-failure
-          gcovr --root .. --html --html-details -o coverage.html
+          ctest --output-on-failure --timeout 60
 
-      - name: Upload coverage
+          # Generate coverage report
+          gcovr --root .. --html --html-details -o coverage.html \
+                --exclude-unreachable-branches --exclude-throw-branches
+
+          # Generate coverage summary
+          COVERAGE=$(gcovr --root .. | grep -E "TOTAL.*%" | awk '{print $NF}')
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "📊 Line Coverage: $COVERAGE" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload coverage report
         if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: build/coverage*
+          retention-days: 30
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.compiler }}-${{ matrix.build_type }}
           path: |
             build/*.log
             build/Testing/
+          retention-days: 7
+
+      - name: Upload build artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-${{ matrix.compiler }}-${{ matrix.build_type }}
+          path: |
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+            build/compile_commands.json
+          retention-days: 7
 
   static-analysis:
     name: Static Analysis
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout code
@@ -110,25 +179,88 @@ jobs:
       - name: Install analysis tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck clang-tools splint
+          sudo apt-get install -y cppcheck clang-tools cmake
+
+      - name: Configure for analysis
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Run cppcheck
         run: |
+          echo "## Static Analysis Results" >> $GITHUB_STEP_SUMMARY
+
           cppcheck --enable=all --inconclusive --xml --xml-version=2 \
                    --suppress=missingIncludeSystem \
                    --suppress=unusedFunction \
+                   --project=build/compile_commands.json \
                    src/ include/ 2> cppcheck-report.xml || true
+
+          # Parse cppcheck results
+          if [ -s cppcheck-report.xml ]; then
+            ERROR_COUNT=$(grep -c "<error" cppcheck-report.xml || echo "0")
+            echo "### Cppcheck Results" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 Found $ERROR_COUNT potential issues" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No cppcheck issues found" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Run clang-tidy
         run: |
-          find src/ -name "*.c" | head -10 | while read file; do
-            clang-tidy "$file" -- -Iinclude/ || true
-          done > clang-tidy-report.txt 2>&1
+          if [ -f build/compile_commands.json ]; then
+            find src/ -name "*.c" -type f | head -10 | while read file; do
+              clang-tidy "$file" -p build/ --quiet || true
+            done > clang-tidy-report.txt 2>&1
+            
+            if [ -s clang-tidy-report.txt ]; then
+              ISSUE_COUNT=$(grep -c "warning:" clang-tidy-report.txt || echo "0")
+              echo "### Clang-Tidy Results" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Found $ISSUE_COUNT warnings" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ No clang-tidy warnings found" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
 
       - name: Upload analysis results
-        uses: actions/upload-artifact@v3
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: static-analysis
+          name: static-analysis-results
           path: |
             cppcheck-report.xml
             clang-tidy-report.txt
+            build/compile_commands.json
+          retention-days: 30
+
+  docs-and-examples:
+    name: Documentation and Examples
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build documentation
+        run: |
+          mkdir -p docs
+          echo "# DSA Algorithms Project" > docs/README.md
+          echo "" >> docs/README.md
+          echo "## Project Structure" >> docs/README.md
+          find src/ -type d | sort | while read dir; do
+            echo "- $(basename "$dir")" >> docs/README.md
+          done
+
+          echo "" >> docs/README.md
+          echo "## Available Functions" >> docs/README.md
+          grep -r "^[a-zA-Z_][a-zA-Z0-9_]*.*(" include/ | head -20 | while read line; do
+            echo "- \`$(echo "$line" | cut -d':' -f2 | sed 's/;//')\`" >> docs/README.md
+          done
+
+      - name: Upload documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-documentation
+          path: docs/
+          retention-days: 90
