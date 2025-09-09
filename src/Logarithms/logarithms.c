@@ -236,7 +236,8 @@ int power (int i) {
 }
 
 int lg_exSix (int N) {
-    for (int i = 0; power(i) <= N; i++) {}
+    int i = 0;
+    for (i = 0; power(i) <= N; i++) {}
     return i - 1;
 }
 

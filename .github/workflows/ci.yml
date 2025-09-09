@@ -1,0 +1,134 @@
+name: DSA Algorithms CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 1" # Weekly Monday 2AM UTC
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential ${{ matrix.compiler }} \
+                                  valgrind cppcheck clang-tools
+
+      - name: Configure CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                   -DCMAKE_C_COMPILER=${{ matrix.cc }}
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --parallel $(nproc) --verbose
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure --parallel $(nproc) --verbose
+
+      - name: Run tests by category
+        if: matrix.build_type == 'Debug'
+        run: |
+          cd build
+          echo "=== Testing Algorithms ===" >> $GITHUB_STEP_SUMMARY
+          ctest -L algorithms --output-on-failure >> test_algorithms.log 2>&1 || true
+          echo "=== Testing Data Structures ===" >> $GITHUB_STEP_SUMMARY
+          ctest -L data_structures --output-on-failure >> test_ds.log 2>&1 || true
+          echo "=== Testing Fundamentals ===" >> $GITHUB_STEP_SUMMARY
+          ctest -L fundamentals --output-on-failure >> test_fundamentals.log 2>&1 || true
+
+      - name: Memory leak check
+        if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
+        run: |
+          cd build
+          find . -name "*test*" -executable -type f | head -5 | while read test; do
+            echo "Checking $test with valgrind..."
+            valgrind --leak-check=full --error-exitcode=1 "$test" || echo "Memory issues in $test"
+          done
+
+      - name: Generate coverage report
+        if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
+        run: |
+          sudo apt-get install -y gcovr
+          cd build
+          # Re-configure with coverage flags
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="--coverage" -DCMAKE_C_COMPILER=gcc
+          cmake --build . --parallel $(nproc)
+          ctest --output-on-failure
+          gcovr --root .. --html --html-details -o coverage.html
+
+      - name: Upload coverage
+        if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: build/coverage*
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.compiler }}-${{ matrix.build_type }}
+          path: |
+            build/*.log
+            build/Testing/
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang-tools splint
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all --inconclusive --xml --xml-version=2 \
+                   --suppress=missingIncludeSystem \
+                   --suppress=unusedFunction \
+                   src/ include/ 2> cppcheck-report.xml || true
+
+      - name: Run clang-tidy
+        run: |
+          find src/ -name "*.c" | head -10 | while read file; do
+            clang-tidy "$file" -- -Iinclude/ || true
+          done > clang-tidy-report.txt 2>&1
+
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v3
+        with:
+          name: static-analysis
+          path: |
+            cppcheck-report.xml
+            clang-tidy-report.txt
